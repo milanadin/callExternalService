@@ -19,17 +19,117 @@
 // 5 Graceful shutdown
 // Сервис должен корректно останавливаться по сигналу ОС (`SIGINT`/`SIGTERM`): перестать брать новые задания, дать текущим завершиться, но не висеть вечно.
 
-package external
+package main
 
 import (
 	"context"
 	"fmt"
+	"log"
 	"math/rand"
+	"os/signal"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 )
 
 type Job struct {
 	ID int
+}
+
+type Result struct {
+	ID  int
+	Err error
+}
+
+type Stats struct {
+	panics  atomic.Int32
+	failed  atomic.Int32
+	sucсess map[int]int
+	mu      sync.RWMutex
+}
+
+func generator(ctx context.Context, N int) chan Job {
+	jobs := make(chan Job)
+
+	go func() {
+		defer close(jobs)
+		for i := 1; i <= N; i++ {
+			select {
+			case jobs <- Job{ID: i}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return jobs
+}
+
+func callCES(ctx context.Context, j Job, s *Stats, workerID int) (res Result) {
+
+	defer func() {
+		if r := recover(); r != nil {
+			res = Result{Err: fmt.Errorf("%v", r)}
+			s.panics.Add(1)
+			return
+		}
+	}()
+
+	r, err := callExternalService(ctx, j)
+	if err != nil {
+		res = Result{Err: err}
+		s.failed.Add(1)
+		return
+
+	}
+
+	res = Result{ID: r}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sucсess[workerID]++
+	return
+}
+
+func workersPool(ctx context.Context, N int, M int, s *Stats, semaphore chan struct{}) chan Result {
+	out := make(chan Result)
+
+	jobs := generator(ctx, N)
+
+	var wg sync.WaitGroup
+	for i := 0; i < M; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case j, ok := <-jobs:
+					if !ok {
+						return
+					}
+					select {
+					case semaphore <- struct{}{}:
+					case <-ctx.Done():
+						return
+					}
+					call := callCES(ctx, j, s, i)
+					<-semaphore
+					select {
+					case out <- call:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	return out
 }
 
 func callExternalService(ctx context.Context, j Job) (int, error) {
@@ -50,4 +150,65 @@ func callExternalService(ctx context.Context, j Job) (int, error) {
 	default:
 		return j.ID * j.ID, nil
 	}
+}
+
+func gracefulShutdown(ctx context.Context, done chan struct{}, wg *sync.WaitGroup) {
+	defer wg.Done()
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		select {
+		case <-done:
+			log.Println("Все воркеры завершили работу. Сервис останавливается.")
+		case <-shutdownCtx.Done():
+			log.Println("Таймаут graceful shutdown завершен. Принудительная остановка.")
+		}
+	case <-done:
+		return
+	}
+}
+
+func printer(s *Stats, wg *sync.WaitGroup, res chan Result, done chan struct{}) {
+	defer wg.Done()
+	defer close(done)
+	for r := range res {
+		fmt.Println(r)
+	}
+	fmt.Println(s.failed.Load(), s.panics.Load())
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for k, v := range s.sucсess {
+		fmt.Println(k, v)
+	}
+}
+
+func main() {
+	const K = 4
+
+	ctxParent, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(ctxParent, 3*time.Second)
+	defer cancel()
+
+	semaphore := make(chan struct{}, K)
+
+	s := Stats{
+		sucсess: make(map[int]int),
+	}
+	res := workersPool(ctx, 10, 3, &s, semaphore)
+
+	done := make(chan struct{})
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go gracefulShutdown(ctx, done, &wg)
+
+	wg.Add(1)
+
+	go printer(&s, &wg, res, done)
+
+	wg.Wait()
 }
